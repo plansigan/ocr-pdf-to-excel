@@ -106,6 +106,29 @@ const OCRComponent = () => {
     return value;
   };
 
+  const processImageFile = async (
+    file,
+    totalPages,
+    globalCompletedPagesRef,
+    setOcrText,
+    setProgress
+  ) => {
+    return Tesseract.recognize(file, "eng", {
+      logger: (m) => {
+        if (m.status === "recognizing text") {
+          const pageProgress = globalCompletedPagesRef.current + m.progress;
+          setProgress(Math.round((pageProgress / totalPages) * 100));
+        }
+      },
+    }).then(({ data: { text } }) => {
+      setOcrText((prevList) => [...prevList, parseReceipt(text)]);
+      globalCompletedPagesRef.current++;
+      setProgress(
+        Math.round((globalCompletedPagesRef.current / totalPages) * 100)
+      );
+    });
+  };
+
   const handleFileChange = async (event) => {
     setIsLoading(true);
     setProgress(0);
@@ -119,12 +142,13 @@ const OCRComponent = () => {
 
     let totalPages = 0;
     const pdfFiles = [];
-    let globalCompletedPages = 0;
+    const globalCompletedPagesRef = { current: 0 }; // Use an object to avoid closures
 
-    // Count both PDF pages and image files as "pages" for progress
-    totalPages = Array.from(files).reduce((acc, file) => {
-      return acc + (file.type === "application/pdf" ? 0 : 1); // Start with image count
-    }, 0);
+    // Count image files first
+    totalPages = Array.from(files).reduce(
+      (acc, file) => acc + (file.type === "application/pdf" ? 0 : 1),
+      0
+    );
 
     // Process PDFs to count their pages
     for (const file of files) {
@@ -135,21 +159,16 @@ const OCRComponent = () => {
       }
     }
 
-    // Process non-PDF files first
+    // Process non-PDF files first (Move processing outside the loop)
     for (const file of files) {
       if (file.type !== "application/pdf") {
-        await Tesseract.recognize(file, "eng", {
-          logger: (m) => {
-            if (m.status === "recognizing text") {
-              const pageProgress = globalCompletedPages + m.progress;
-              setProgress(Math.round((pageProgress / totalPages) * 100));
-            }
-          },
-        }).then(({ data: { text } }) => {
-          setOcrText((prevList) => [...prevList, parseReceipt(text)]);
-          globalCompletedPages++;
-          setProgress(Math.round((globalCompletedPages / totalPages) * 100));
-        });
+        await processImageFile(
+          file,
+          totalPages,
+          globalCompletedPagesRef,
+          setOcrText,
+          setProgress
+        );
       }
     }
 
@@ -169,15 +188,17 @@ const OCRComponent = () => {
         const text = await Tesseract.recognize(canvas, "eng", {
           logger: (m) => {
             if (m.status === "recognizing text") {
-              const pageProgress = globalCompletedPages + m.progress;
+              const pageProgress = globalCompletedPagesRef.current + m.progress;
               setProgress(Math.round((pageProgress / totalPages) * 100));
             }
           },
         }).then(({ data: { text } }) => text);
 
         allText += text + "\n\n";
-        globalCompletedPages++;
-        setProgress(Math.round((globalCompletedPages / totalPages) * 100));
+        globalCompletedPagesRef.current++;
+        setProgress(
+          Math.round((globalCompletedPagesRef.current / totalPages) * 100)
+        );
       }
       setOcrText((prevList) => [...prevList, parseReceipt(allText)]);
     }
@@ -201,22 +222,22 @@ const OCRComponent = () => {
       alert("Please upload an Excel file first.");
       return;
     }
-  
+
     if (ocrText.length === 0) {
       alert("Please upload at least one PDF file first");
       return;
     }
-  
+
     // Columns to preserve (formula columns)
     const formulaColumns = new Set([6, 7, 10, 36, 37, 45, 46]);
-  
+
     // Clear existing data from each branch sheet
     branchList.forEach((branch) => {
       const branchSheet = workbook.worksheets.find(
         (sheet) => sheet.name === branch
       );
       if (!branchSheet) return;
-  
+
       branchSheet.eachRow((row, rowNumber) => {
         if (rowNumber >= 3 && rowNumber <= 48) {
           row.eachCell((cell, colNumber) => {
@@ -229,7 +250,7 @@ const OCRComponent = () => {
         }
       });
     });
-  
+
     // Sort and group receipts by sheet
     const sortedReceipts = ocrText.sort(
       (a, b) => new Date(b.dateIssued) - new Date(a.dateIssued)
@@ -240,7 +261,7 @@ const OCRComponent = () => {
       acc[sheet].push(receipt);
       return acc;
     }, {});
-  
+
     // Populate data per sheet
     branchList.forEach((branch) => {
       const worksheet = workbook.worksheets.find(
@@ -250,23 +271,23 @@ const OCRComponent = () => {
         console.warn(`Sheet ${branch} not found. Skipping.`);
         return;
       }
-  
+
       const receipts = groupedBySheet[branch] || [];
       let currentRow = 3;
-  
+
       receipts.forEach((receipt) => {
         // Skip row 49 if encountered
         if (currentRow === 49) currentRow++;
-  
+
         const row = worksheet.getRow(currentRow);
         headers.forEach((header, colIndex) => {
           const colNumber = colIndex + 1;
           if (formulaColumns.has(colNumber)) return;
-  
+
           const mappedKey = headerMapping[header];
           const rawValue = receipt[mappedKey];
           let finalValue = "";
-  
+
           if (rawValue) {
             if (dateKeys.has(mappedKey)) {
               finalValue = formatDateValue(rawValue);
@@ -276,15 +297,15 @@ const OCRComponent = () => {
               finalValue = isNaN(numericValue) ? "" : numericValue;
             }
           }
-  
+
           row.getCell(colNumber).value = finalValue;
         });
-  
+
         row.commit();
         currentRow++;
       });
     });
-  
+
     // Save the updated workbook
     const buffer = await workbook.xlsx.writeBuffer();
     const blob = new Blob([buffer], {
