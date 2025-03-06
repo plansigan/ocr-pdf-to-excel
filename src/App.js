@@ -1,24 +1,20 @@
-import logo from './logo.svg';
-import './App.css';
+import React from 'react';
+import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
+import DocumentUploadPage from './components/DocumentUploadPage';
+import DocumentListPage from './components/DocumentListPage';
+import { OCRProvider } from './context/OCRContext';
 
 function App() {
   return (
-    <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
-      </header>
-    </div>
+    <OCRProvider>
+      <Router>
+        <Routes>
+          <Route path="/upload" element={<DocumentUploadPage />} />
+          <Route path="/documents" element={<DocumentListPage />} />
+          <Route path="/" element={<DocumentUploadPage />} />
+        </Routes>
+      </Router>
+    </OCRProvider>
   );
 }
 
