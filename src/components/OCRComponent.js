@@ -4,6 +4,7 @@ import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
 import { parseReceipt } from "../utils/helper";
+import { branchList } from "../utils/const";
 
 GlobalWorkerOptions.workerSrc = `${process.env.PUBLIC_URL}/pdf.worker.min.mjs`;
 
@@ -200,67 +201,91 @@ const OCRComponent = () => {
       alert("Please upload an Excel file first.");
       return;
     }
-
+  
     if (ocrText.length === 0) {
       alert("Please upload at least one PDF file first");
       return;
     }
-    const worksheet = workbook.worksheets[0] || workbook.addWorksheet("Sheet1");
-
+  
+    // Columns to preserve (formula columns)
     const formulaColumns = new Set([6, 7, 10, 36, 37, 45, 46]);
-
-    worksheet.eachRow((row, rowNumber) => {
-      if (rowNumber >= 3 && rowNumber <= 48) {
-        row.eachCell((cell, colNumber) => {
-          if (!formulaColumns.has(colNumber)) {
-            cell.value = null;
-          }
-        });
-      } else if (rowNumber >= 50) {
-        // Clear entire rows for 50+
-        row.eachCell((cell) => {
-          cell.value = null;
-          cell.formula = undefined;
-        });
-      }
+  
+    // Clear existing data from each branch sheet
+    branchList.forEach((branch) => {
+      const branchSheet = workbook.worksheets.find(
+        (sheet) => sheet.name === branch
+      );
+      if (!branchSheet) return;
+  
+      branchSheet.eachRow((row, rowNumber) => {
+        if (rowNumber >= 3 && rowNumber <= 48) {
+          row.eachCell((cell, colNumber) => {
+            if (!formulaColumns.has(colNumber)) {
+              cell.value = null;
+            }
+          });
+        } else if (rowNumber >= 50) {
+          row.eachCell((cell) => (cell.value = null));
+        }
+      });
     });
-
-    // Populate new data starting from row 3
-    let rowIndex = 3;
-    ocrText
-      .sort((a, b) => new Date(b.dateIssued) - new Date(a.dateIssued))
-      .forEach((receiptObj) => {
-        if (rowIndex === 49) rowIndex++; // Skip row 49
-
-        const row = worksheet.getRow(rowIndex);
+  
+    // Sort and group receipts by sheet
+    const sortedReceipts = ocrText.sort(
+      (a, b) => new Date(b.dateIssued) - new Date(a.dateIssued)
+    );
+    const groupedBySheet = sortedReceipts.reduce((acc, receipt) => {
+      const sheet = receipt.sheet;
+      if (!acc[sheet]) acc[sheet] = [];
+      acc[sheet].push(receipt);
+      return acc;
+    }, {});
+  
+    // Populate data per sheet
+    branchList.forEach((branch) => {
+      const worksheet = workbook.worksheets.find(
+        (sheet) => sheet.name === branch
+      );
+      if (!worksheet) {
+        console.warn(`Sheet ${branch} not found. Skipping.`);
+        return;
+      }
+  
+      const receipts = groupedBySheet[branch] || [];
+      let currentRow = 3;
+  
+      receipts.forEach((receipt) => {
+        // Skip row 49 if encountered
+        if (currentRow === 49) currentRow++;
+  
+        const row = worksheet.getRow(currentRow);
         headers.forEach((header, colIndex) => {
-          const colNumber = colIndex + 1; // Convert to 1-based index
-          // Skip formula columns in all rows
+          const colNumber = colIndex + 1;
           if (formulaColumns.has(colNumber)) return;
-
+  
           const mappedKey = headerMapping[header];
-          const rawValue = receiptObj[mappedKey];
+          const rawValue = receipt[mappedKey];
           let finalValue = "";
-
+  
           if (rawValue) {
             if (dateKeys.has(mappedKey)) {
               finalValue = formatDateValue(rawValue);
-            } else if (
-              typeof rawValue === "string" &&
-              rawValue.match(/[\d,]+\.\d+/)
-            ) {
-              finalValue = parseFloat(rawValue.replace(/,/g, ""));
             } else {
-              finalValue = rawValue;
+              // Handle numeric values
+              const numericValue = parseFloat(rawValue.replace(/,/g, ""));
+              finalValue = isNaN(numericValue) ? "" : numericValue;
             }
           }
+  
           row.getCell(colNumber).value = finalValue;
         });
+  
         row.commit();
-        rowIndex++;
+        currentRow++;
       });
-
-    // Save updated workbook
+    });
+  
+    // Save the updated workbook
     const buffer = await workbook.xlsx.writeBuffer();
     const blob = new Blob([buffer], {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

@@ -1,3 +1,4 @@
+import { branchMap } from "./const";
 
 function toCamelCase(str) {
   return (
@@ -23,8 +24,18 @@ export function parseReceipt(text) {
   const data = {};
   const lines = text.split("\n");
 
+  //getting the sheet
+  const regexBranch = /\b(SM CITY CLARK|SM CITY PAMPANGA)\b/;
+  const branch = lines[3].trim().match(regexBranch);
+  const sheet = branchMap[branch[0]];
+
+  data.sheet = sheet
+
   lines.forEach((line) => {
     const trimmedLine = line.trim();
+
+    if (trimmedLine) {
+    }
     if (trimmedLine.includes(":")) {
       // Split the line into key and value parts using the first occurrence of ":"
       const [key, ...valueParts] = trimmedLine.split(":");
