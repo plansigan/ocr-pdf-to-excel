@@ -245,8 +245,6 @@ const OCRComponent = () => {
               cell.value = null;
             }
           });
-        } else if (rowNumber >= 50) {
-          row.eachCell((cell) => (cell.value = null));
         }
       });
     });
@@ -271,36 +269,48 @@ const OCRComponent = () => {
         console.warn(`Sheet ${branch} not found. Skipping.`);
         return;
       }
-
+  
       const receipts = groupedBySheet[branch] || [];
       let currentRow = 3;
-
+  
       receipts.forEach((receipt) => {
-        // Skip row 49 if encountered
         if (currentRow === 49) currentRow++;
-
+  
         const row = worksheet.getRow(currentRow);
         headers.forEach((header, colIndex) => {
           const colNumber = colIndex + 1;
           if (formulaColumns.has(colNumber)) return;
-
+  
           const mappedKey = headerMapping[header];
           const rawValue = receipt[mappedKey];
           let finalValue = "";
-
+          let isExplicitZero = false; // Flag to track explicit zeros
+  
           if (rawValue) {
             if (dateKeys.has(mappedKey)) {
               finalValue = formatDateValue(rawValue);
             } else {
-              // Handle numeric values
               const numericValue = parseFloat(rawValue.replace(/,/g, ""));
-              finalValue = isNaN(numericValue) ? "" : numericValue;
+              finalValue = isNaN(numericValue) ? 0 : numericValue;
+              isExplicitZero = numericValue === 0; // Mark explicit zero
             }
+          } else {
+            finalValue = dateKeys.has(mappedKey) ? "" : 0;
           }
-
-          row.getCell(colNumber).value = finalValue;
+  
+          const cell = row.getCell(colNumber);
+          cell.value = finalValue;
+  
+          // Hide zeros for numeric columns
+          if (
+            !dateKeys.has(mappedKey) &&
+            finalValue === 0 &&
+            !isExplicitZero
+          ) {
+            cell.numFmt = "0;-0;;@"; // Custom format to hide zero
+          }
         });
-
+  
         row.commit();
         currentRow++;
       });
