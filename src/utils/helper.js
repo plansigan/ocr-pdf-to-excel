@@ -24,18 +24,14 @@ export function parseReceipt(text) {
   const data = {};
   const lines = text.split("\n");
 
-  //getting the sheet
+  // Search the full OCR text for the branch name rather than assuming line index 3
   const regexBranch = /\b(SM CITY CLARK|SM CITY PAMPANGA)\b/;
-  const branch = lines[3].trim().match(regexBranch);
-  const sheet = branchMap[branch[0]];
-
-  data.sheet = sheet
+  const branch = text.match(regexBranch);
+  data.sheet = branch ? branchMap[branch[0]] : undefined;
 
   lines.forEach((line) => {
     const trimmedLine = line.trim();
 
-    if (trimmedLine) {
-    }
     if (trimmedLine.includes(":")) {
       // Split the line into key and value parts using the first occurrence of ":"
       const [key, ...valueParts] = trimmedLine.split(":");

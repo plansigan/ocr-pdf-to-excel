@@ -1,5 +1,5 @@
-import React, { useState } from "react";
-import Tesseract from "tesseract.js";
+import React, { useEffect, useRef, useState } from "react";
+import { createWorker } from "tesseract.js";
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
@@ -8,12 +8,35 @@ import { branchList } from "../utils/const";
 
 GlobalWorkerOptions.workerSrc = `${process.env.PUBLIC_URL}/pdf.worker.min.mjs`;
 
+const runWithBackgroundLock = (fn) => {
+  if (typeof navigator !== "undefined" && navigator.locks?.request) {
+    return navigator.locks.request("ocr-conversion-lock", fn);
+  }
+  return fn();
+};
+
 const OCRComponent = () => {
   // Array of receipt objects (each returned from parseReceipt)
   const [ocrText, setOcrText] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [error, setError] = useState(null);
   const [workbook, setWorkbook] = useState(null);
+  const activeWorkerRef = useRef(null);
+
+  useEffect(() => {
+    const styleSheet = document.createElement("style");
+    styleSheet.textContent = styles;
+    document.head.appendChild(styleSheet);
+
+    return () => {
+      styleSheet.remove();
+      if (activeWorkerRef.current) {
+        activeWorkerRef.current.terminate();
+        activeWorkerRef.current = null;
+      }
+    };
+  }, []);
 
   // Column headers (residing in row 2)
   const headers = [
@@ -106,33 +129,128 @@ const OCRComponent = () => {
     return value;
   };
 
-  const processImageFile = async (
-    file,
-    totalPages,
-    globalCompletedPagesRef,
-    setOcrText,
-    setProgress
-  ) => {
-    return Tesseract.recognize(file, "eng", {
-      logger: (m) => {
-        if (m.status === "recognizing text") {
-          const pageProgress = globalCompletedPagesRef.current + m.progress;
-          setProgress(Math.round((pageProgress / totalPages) * 100));
-        }
-      },
-    }).then(({ data: { text } }) => {
-      setOcrText((prevList) => [...prevList, parseReceipt(text)]);
-      globalCompletedPagesRef.current++;
-      setProgress(
-        Math.round((globalCompletedPagesRef.current / totalPages) * 100)
+  const processFilesInWorker = async (filePayloads) => {
+    return new Promise((resolve, reject) => {
+      if (activeWorkerRef.current) {
+        activeWorkerRef.current.terminate();
+      }
+
+      const worker = new Worker(
+        new URL("../workers/ocrWorker.js", import.meta.url)
       );
+      activeWorkerRef.current = worker;
+
+      const cleanup = () => {
+        if (activeWorkerRef.current === worker) {
+          activeWorkerRef.current = null;
+        }
+        worker.terminate();
+      };
+
+      worker.onmessage = (event) => {
+        const { type, progress: workerProgress, results, message } = event.data;
+        if (type === "progress") {
+          setProgress(workerProgress);
+        } else if (type === "complete") {
+          cleanup();
+          resolve(results);
+        } else if (type === "error") {
+          cleanup();
+          reject(new Error(message || "Worker OCR processing failed."));
+        }
+      };
+
+      worker.onerror = (err) => {
+        cleanup();
+        reject(new Error(err?.message || "OCR worker encountered an error."));
+      };
+
+      const transferables = filePayloads.map((item) => item.buffer);
+      worker.postMessage({ files: filePayloads }, transferables);
     });
   };
 
+  const processFilesOnMainThread = async (filePayloads) => {
+    let totalPages = 0;
+    const pdfDocs = [];
+    const imagePayloads = [];
+
+    for (const fileData of filePayloads) {
+      if (fileData.type === "application/pdf") {
+        const pdf = await getDocument({ data: new Uint8Array(fileData.buffer) })
+          .promise;
+        totalPages += pdf.numPages;
+        pdfDocs.push(pdf);
+      } else {
+        totalPages += 1;
+        imagePayloads.push(fileData);
+      }
+    }
+
+    if (totalPages === 0) return [];
+
+    let completedPages = 0;
+    const reportProgress = (fraction = 0) => {
+      setProgress(
+        Math.min(100, Math.round(((completedPages + fraction) / totalPages) * 100))
+      );
+    };
+
+    const worker = await createWorker("eng", 1, {
+      logger: (m) => {
+        if (m.status === "recognizing text") {
+          reportProgress(m.progress);
+        }
+      },
+    });
+
+    const results = [];
+    try {
+      for (const fileData of imagePayloads) {
+        const blob = new Blob([fileData.buffer], {
+          type: fileData.type || "image/png",
+        });
+        const {
+          data: { text },
+        } = await worker.recognize(blob);
+        results.push(parseReceipt(text));
+        completedPages += 1;
+        reportProgress(0);
+      }
+
+      for (const pdf of pdfDocs) {
+        let allText = "";
+        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+          const page = await pdf.getPage(pageNum);
+          const viewport = page.getViewport({ scale: 2 });
+          const canvas = document.createElement("canvas");
+          const context = canvas.getContext("2d");
+          canvas.height = viewport.height;
+          canvas.width = viewport.width;
+
+          await page.render({ canvasContext: context, viewport }).promise;
+          const {
+            data: { text },
+          } = await worker.recognize(canvas);
+          allText += text + "\n\n";
+          completedPages += 1;
+          reportProgress(0);
+        }
+        results.push(parseReceipt(allText));
+      }
+    } finally {
+      await worker.terminate().catch(() => {});
+      for (const pdf of pdfDocs) {
+        await pdf.destroy().catch(() => {});
+      }
+    }
+
+    return results;
+  };
+
   const handleFileChange = async (event) => {
-    setIsLoading(true);
-    setProgress(0);
-    const files = event.target.files;
+    const files = Array.from(event.target.files || []);
+    setError(null);
     setOcrText([]);
 
     if (files.length === 0) {
@@ -140,80 +258,51 @@ const OCRComponent = () => {
       return;
     }
 
-    let totalPages = 0;
-    const pdfFiles = [];
-    const globalCompletedPagesRef = { current: 0 }; // Use an object to avoid closures
+    setIsLoading(true);
+    setProgress(0);
 
-    // Count image files first
-    totalPages = Array.from(files).reduce(
-      (acc, file) => acc + (file.type === "application/pdf" ? 0 : 1),
-      0
-    );
+    try {
+      const filePayloads = await Promise.all(
+        files.map(async (file) => ({
+          name: file.name,
+          type: file.type,
+          buffer: await file.arrayBuffer(),
+        }))
+      );
 
-    // Process PDFs to count their pages
-    for (const file of files) {
-      if (file.type === "application/pdf") {
-        const pdf = await getDocument(URL.createObjectURL(file)).promise;
-        totalPages += pdf.numPages;
-        pdfFiles.push({ file, pdf });
-      }
+      const canUseWorker =
+        typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined";
+
+      const results = await runWithBackgroundLock(() =>
+        canUseWorker
+          ? processFilesInWorker(filePayloads)
+          : processFilesOnMainThread(filePayloads)
+      );
+
+      setOcrText(results);
+      setProgress(100);
+    } catch (err) {
+      console.error("OCR processing failed:", err);
+      setError(err?.message || "Failed to process uploaded files.");
+    } finally {
+      setIsLoading(false);
     }
-
-    // Process non-PDF files first (Move processing outside the loop)
-    for (const file of files) {
-      if (file.type !== "application/pdf") {
-        await processImageFile(
-          file,
-          totalPages,
-          globalCompletedPagesRef,
-          setOcrText,
-          setProgress
-        );
-      }
-    }
-
-    // Process PDF files
-    for (const { pdf } of pdfFiles) {
-      let allText = "";
-      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-        const page = await pdf.getPage(pageNum);
-        const viewport = page.getViewport({ scale: 2 });
-        const canvas = document.createElement("canvas");
-        const context = canvas.getContext("2d");
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
-
-        await page.render({ canvasContext: context, viewport }).promise;
-
-        const text = await Tesseract.recognize(canvas, "eng", {
-          logger: (m) => {
-            if (m.status === "recognizing text") {
-              const pageProgress = globalCompletedPagesRef.current + m.progress;
-              setProgress(Math.round((pageProgress / totalPages) * 100));
-            }
-          },
-        }).then(({ data: { text } }) => text);
-
-        allText += text + "\n\n";
-        globalCompletedPagesRef.current++;
-        setProgress(
-          Math.round((globalCompletedPagesRef.current / totalPages) * 100)
-        );
-      }
-      setOcrText((prevList) => [...prevList, parseReceipt(allText)]);
-    }
-    setIsLoading(false);
-    setProgress(100);
   };
 
   // Handle Excel file upload
   const handleExcelFileChange = async (event) => {
-    const file = event.target.files[0];
-    if (file) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setError(null);
+    try {
       const arrayBuffer = await file.arrayBuffer();
       const wb = new ExcelJS.Workbook();
       await wb.xlsx.load(arrayBuffer);
       setWorkbook(wb);
+    } catch (err) {
+      console.error("Failed to load Excel template:", err);
+      setError("Failed to load the Excel template. Please check the file.");
     }
   };
 
@@ -224,7 +313,7 @@ const OCRComponent = () => {
     }
 
     if (ocrText.length === 0) {
-      alert("Please upload at least one PDF file first");
+      alert("Please upload at least one PDF or image file first.");
       return;
     }
 
@@ -249,12 +338,15 @@ const OCRComponent = () => {
       });
     });
 
-    // Sort and group receipts by sheet
-    const sortedReceipts = ocrText.sort(
-      (a, b) => new Date(b.dateIssued) - new Date(a.dateIssued)
-    );
+    // Sort and group receipts by sheet without mutating state
+    const sortedReceipts = [...ocrText].sort((a, b) => {
+      const timeA = a.dateIssued ? new Date(a.dateIssued).getTime() : 0;
+      const timeB = b.dateIssued ? new Date(b.dateIssued).getTime() : 0;
+      return (isNaN(timeB) ? 0 : timeB) - (isNaN(timeA) ? 0 : timeA);
+    });
     const groupedBySheet = sortedReceipts.reduce((acc, receipt) => {
       const sheet = receipt.sheet;
+      if (!sheet) return acc;
       if (!acc[sheet]) acc[sheet] = [];
       acc[sheet].push(receipt);
       return acc;
@@ -269,38 +361,38 @@ const OCRComponent = () => {
         console.warn(`Sheet ${branch} not found. Skipping.`);
         return;
       }
-  
+
       const receipts = groupedBySheet[branch] || [];
       let currentRow = 3;
-  
+
       receipts.forEach((receipt) => {
         if (currentRow === 49) currentRow++;
-  
+
         const row = worksheet.getRow(currentRow);
         headers.forEach((header, colIndex) => {
           const colNumber = colIndex + 1;
           if (formulaColumns.has(colNumber)) return;
-  
+
           const mappedKey = headerMapping[header];
           const rawValue = receipt[mappedKey];
           let finalValue = "";
           let isExplicitZero = false; // Flag to track explicit zeros
-  
-          if (rawValue) {
+
+          if (rawValue !== undefined && rawValue !== null && rawValue !== "") {
             if (dateKeys.has(mappedKey)) {
               finalValue = formatDateValue(rawValue);
             } else {
-              const numericValue = parseFloat(rawValue.replace(/,/g, ""));
+              const numericValue = parseFloat(String(rawValue).replace(/,/g, ""));
               finalValue = isNaN(numericValue) ? 0 : numericValue;
               isExplicitZero = numericValue === 0; // Mark explicit zero
             }
           } else {
             finalValue = dateKeys.has(mappedKey) ? "" : 0;
           }
-  
+
           const cell = row.getCell(colNumber);
           cell.value = finalValue;
-  
+
           // Hide zeros for numeric columns
           if (
             !dateKeys.has(mappedKey) &&
@@ -310,7 +402,7 @@ const OCRComponent = () => {
             cell.numFmt = "0;-0;;@"; // Custom format to hide zero
           }
         });
-  
+
         row.commit();
         currentRow++;
       });
@@ -334,6 +426,7 @@ const OCRComponent = () => {
             onChange={handleFileChange}
             accept="image/*,application/pdf"
             multiple
+            disabled={isLoading}
           />
           <span className="upload-button">Choose Files</span>
         </label>
@@ -355,6 +448,14 @@ const OCRComponent = () => {
         <div className="progress-container">
           <div className="progress-bar" style={{ width: `${progress}%` }}></div>
           <div className="progress-text">{progress}%</div>
+        </div>
+      )}
+
+      {error && <div className="error-message">{error}</div>}
+
+      {!isLoading && ocrText.length > 0 && (
+        <div className="status-message">
+          Processed {ocrText.length} receipt(s).
         </div>
       )}
 
@@ -471,11 +572,22 @@ h2 {
   background: #95a5a6;
   cursor: not-allowed;
 }
-`;
 
-// Inject styles
-const styleSheet = document.createElement("style");
-styleSheet.innerText = styles;
-document.head.appendChild(styleSheet);
+.error-message {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  background: #fdecea;
+  color: #b71c1c;
+  border-radius: 5px;
+}
+
+.status-message {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  background: #e8f5e9;
+  color: #1b5e20;
+  border-radius: 5px;
+}
+`;
 
 export default OCRComponent;
